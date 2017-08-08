@@ -1,39 +1,62 @@
 package main
 
-import (
-	"log"
-	"time"
-
-	"github.com/hansj66/ucam-iii/ucam"
-
-	"github.com/tarm/serial"
-)
+import "github.com/hansj66/ucam-iii/ucam"
+import "log"
 
 func main() {
 
-	log.Println("Opening com port")
+	// To be 100% sure of camera state, a hardware reset should be issued before communicating with the camera
 
-	config := &serial.Config{Name: "COM18", Baud: 57600, ReadTimeout: time.Millisecond * 1000}
-	port, err := serial.OpenPort(config)
+	camera := ucam.NewCamera("/dev/cu.wchusbserial14120")
+	camera.Log(true)
+
+	var err error
+	//var buf []byte
+
+	err = camera.Connect()
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Println("com port opened ok")
-
-	log.Print("Syncing...")
-	err = ucam.Sync(port)
+	err = camera.DisableSleepTimeout()
 	if err != nil {
-		log.Println(err)
-		return
+		log.Fatal(err)
 	}
-	log.Println("Sync complete")
-
-	log.Println("Disabling sleep mode.")
-	err = ucam.DisableSleepTimeout(port)
+	err = camera.SetImageFormats(ucam.RAW16BitColourRGB, ucam.RAW128x128, ucam.JPEG640x480)
 	if err != nil {
-		log.Println(err)
-		return
+		log.Fatal(err)
 	}
-	log.Println("Sleep timeout disabled.")
+	err = camera.SetExposure(ucam.CNormal, ucam.BNormal, ucam.EZero)
+	if err != nil {
+		log.Fatal(err)
+	}
+	err = camera.SetPackageSize(512)
+	if err != nil {
+		log.Fatal(err)
+	}
+	err = camera.Snapshot(ucam.JPEG)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	_, err = camera.GetPicture(ucam.Snapshot)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 }
+
+/*
+
+Skriv som PPM-filer ?
+Se på behov for sleep i mellom kall
+Sjekk mulighet for å endre baudrate on the fly på bibliotekssiden
+
+Se nederst side 9 mht om package size må settes eller ikke (for RAW)
+SetPackageSize
+Light
+Snapshot / Get picture
+
+lagre bildet som PNG
+
+Send ACK i retur (sjekk spek)
+*/
