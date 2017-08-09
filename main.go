@@ -5,9 +5,9 @@ import "log"
 
 func main() {
 
-	// To be 100% sure of camera state, a hardware reset should be issued before communicating with the camera
+	// To be 100% sure of camera state, a hardware reset should be issued before communicating with the camera. (The reset pin is active low.)
 
-	camera := ucam.NewCamera("/dev/cu.wchusbserial14120")
+	camera := ucam.NewCamera("/dev/cu.wchusbserial14110", 9600)
 	camera.Log(true)
 
 	var err error
@@ -21,7 +21,13 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	err = camera.SetImageFormats(ucam.RAW16BitColourRGB, ucam.RAW128x128, ucam.JPEG640x480)
+
+	err = camera.SetBaudRate(9600)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	err = camera.SetImageFormats(ucam.JPEG16Bit, ucam.RAW128x128, ucam.JPEG160x128)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -29,7 +35,11 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	err = camera.SetPackageSize(512)
+	err = camera.SetLightFrequency(50)
+	if err != nil {
+		log.Fatal(err)
+	}
+	err = camera.SetPackageSize(128)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -44,19 +54,3 @@ func main() {
 	}
 
 }
-
-/*
-
-Skriv som PPM-filer ?
-Se på behov for sleep i mellom kall
-Sjekk mulighet for å endre baudrate on the fly på bibliotekssiden
-
-Se nederst side 9 mht om package size må settes eller ikke (for RAW)
-SetPackageSize
-Light
-Snapshot / Get picture
-
-lagre bildet som PNG
-
-Send ACK i retur (sjekk spek)
-*/

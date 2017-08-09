@@ -5,23 +5,12 @@ import (
 	"log"
 	"time"
 
-	"errors"
-
 	"fmt"
 
 	"github.com/tarm/serial"
 )
 
 const maxRetries int = 60
-
-type CameraResponseType byte
-
-const (
-	ACK     CameraResponseType = 0
-	NAK     CameraResponseType = 1
-	TIMEOUT CameraResponseType = 2
-	EOF     CameraResponseType = 4
-)
 
 type FormatType byte
 
@@ -95,7 +84,9 @@ const (
 )
 
 type Camera struct {
+	baudRate    int
 	port        *serial.Port
+	portName    string
 	ImageFormat ImageFormatType
 	XSize       uint16
 	YSize       uint16
@@ -104,97 +95,258 @@ type Camera struct {
 	packageSize uint16
 }
 
-func NewCamera(serialPortName string) Camera {
+// NewCamera ctreates a new camera instance
+func NewCamera(portName string, baudrate int) Camera {
 	log.Println("Opening com port")
-	config := &serial.Config{Name: serialPortName, Baud: 57600, ReadTimeout: time.Millisecond * 250}
+	config := &serial.Config{Name: portName, Baud: baudrate, ReadTimeout: time.Millisecond * 500}
 	port, err := serial.OpenPort(config)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	return Camera{
-		port:    port,
-		logging: false,
+		portName: portName,
+		baudRate: 115200,
+		port:     port,
+		logging:  false,
 	}
 }
 
+// Log enables/disables logging
 func (c *Camera) Log(enable bool) {
 	c.logging = enable
 }
 
-// uCam-III command templates
-var syncCommand = []byte{0xAA, 0x0D, 0x00, 0x00, 0x00, 0x00}
-var sleepCommand = []byte{0xAA, 0x15, 0x00, 0x00, 0x00, 0x00}
-var initialCommand = []byte{0xAA, 0x01, 0x00, 0x00, 0x00, 0x00}
-var exposureCommand = []byte{0xAA, 0x14, 0x00, 0x00, 0x00, 0x00}
-var snapshotCommand = []byte{0xAA, 0x05, 0x00, 0x00, 0x00, 0x00}
-var setPackageSizeCommand = []byte{0xAA, 0x06, 0x08, 0x00, 0x00, 0x00}
-var getPictureCommand = []byte{0xAA, 0x04, 0x00, 0x00, 0x00, 0x00}
+const defaultTimeout = 5 * time.Millisecond // [8.1 Synchronizing the uCam-III]
+var timeout = defaultTimeout                // [8.1 Synchronizing the uCam-III]
 
-var timeout = 5 * time.Millisecond
-
-var ack = []byte{0xAA, 0x0E, 0x00, 0x00, 0x00, 0x00}
 var nak = []byte{0xAA, 0x0F, 0x00, 0x00, 0x00, 0x00}
 
-func (c *Camera) command(command []byte) CameraResponseType {
-	_, err := c.port.Write(command)
-	if err != nil {
-		log.Fatal(err)
+func errorLookup(errorCode byte) string {
+	switch errorCode {
+	case 0x01:
+		return "Picture Type Error"
+	case 0x0B:
+		return "Parameter Error"
+	case 0x02:
+		return "Picture Up Scale"
+	case 0x0C:
+		return "Send Register Timeout"
+	case 0x03:
+		return "Picture Scale Error"
+	case 0x0D:
+		return "Command ID Error"
+	case 0x04:
+		return "Unexpected Reply 04h"
+	case 0x0F:
+		return "Picture Not Ready 0Fh"
+	case 0x05:
+		return "Send Picture Timeout"
+	case 0x10:
+		return "Transfer Package Number Error"
+	case 0x06:
+		return "Unexpected Command"
+	case 0x11:
+		return "Set Transfer Package Size Wrong"
+	case 0x07:
+		return "SRAM JPEG Type Error"
+	case 0xF0:
+		return "Command Header Error"
+	case 0x08:
+		return "SRAM JPEG Size Error"
+	case 0xF1:
+		return "Command Length Error"
+	case 0x09:
+		return "Picture Format Error"
+	case 0xF5:
+		return "Send Picture Error"
+	case 0x0A:
+		return "Picture Size Error"
+	case 0xFF:
+		return "Send Command Error"
 	}
-	if c.logging {
-		log.Println("Sent    : ", fmt.Sprintf("%02X %02X %02X %02X %02X %02X", command[0], command[1], command[2], command[3], command[4], command[5]))
+	return "Doh! Undocumented error"
+}
+
+func commandLookup(commandID byte) string {
+	switch commandID {
+	case 0x01:
+		return "INITIAL"
+	case 0x04:
+		return "GET PICTURE"
+	case 0x05:
+		return "SNAPSHOT"
+	case 0x06:
+		return "SET PACKAGE SIZE"
+	case 0x07:
+		return "SET BAUD RATE"
+	case 0x08:
+		return "RESET"
+	case 0x0A:
+		return "DATA"
+	case 0x0D:
+		return "SYNC"
+	case 0x0E:
+		return "ACK"
+	case 0x0F:
+		return "NAK"
+	case 0x13:
+		return "LIGHT"
+	case 0x14:
+		return "CONTRAST / BRIGHTNESS / EXPOSURE"
+	case 0x15:
+		return "SLEEP"
 	}
-	buf := make([]byte, 12)
-	n, err2 := c.port.Read(buf)
-	if n == 0 {
-		return EOF
-	} else if err2 != nil {
-		log.Fatal(err)
+	return fmt.Sprintf("Unknown command : %d", commandID)
+}
+
+// command method executes a uCam-III command [7. Command set]
+func (c *Camera) command(command []byte) ([]byte, error) {
+	var ack = []byte{0xAA, 0x0E, 0x00, 0x00, 0x00, 0x00}
+
+	response := make([]byte, 128)
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		_, errorWrite := c.port.Write(command)
+		if errorWrite != nil {
+			return nil, errorWrite
+		}
+		if c.logging {
+			log.Println("Sent    : ", fmt.Sprintf("%02X %02X %02X %02X %02X %02X", command[0], command[1], command[2], command[3], command[4], command[5]))
+		}
+		n, errorRead := c.port.Read(response)
+		// EOF is ok. The camera doesn't respond if it is asleep
+		if errorRead != nil && n != 0 {
+			return nil, errorRead
+		}
+
+		/*	if c.logging {
+				log.Println("Received: ", fmt.Sprintf("%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X", response[0], response[1], response[2], response[3], response[4], response[5], response[6], response[7], response[8], response[9], response[10], response[11]))
+			}
+		*/
+		if bytes.Equal(response[:2], ack[:2]) {
+			timeout = defaultTimeout
+			return response, nil
+		} else if bytes.Equal(response[:2], nak[:2]) {
+			log.Println(errorLookup(response[4]), " : ", fmt.Sprintf("%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X", response[0], response[1], response[2], response[3], response[4], response[5], response[6], response[7], response[8], response[9], response[10], response[11]))
+		}
+
+		time.Sleep(timeout)
+		timeout++
+	}
+	return nil, fmt.Errorf("No camera response. Command %02d failed (%s)", command[1], commandLookup(command[1]))
+}
+
+// Light : [7.11 LIGHT (AA13h)]
+func (c *Camera) SetLightFrequency(frequency byte) error {
+	if (frequency != 50) && (frequency != 60) {
+		return fmt.Errorf("Invalid frequency(%d)", frequency)
+	}
+	var frequencyType byte
+	switch frequency {
+	case 50:
+		frequencyType = 0
+	case 60:
+		frequencyType = 1
+	}
+	_, err := c.command([]byte{0xAA, 0x13, frequencyType, 0x00, 0x00, 0x00})
+	if err == nil && c.logging {
+		log.Printf("Light frequency set to %d Hz\n", frequency)
 	}
 
-	if c.logging {
-		log.Println("Received: ", fmt.Sprintf("%02X %02X %02X %02X %02X %02X %02X %02X", buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]))
-	}
-	if bytes.Equal(buf[:2], nak[:2]) {
-		time.Sleep(time.Millisecond * 500)
-		return NAK
-	}
-	if bytes.Equal(buf[:2], ack[:2]) {
-		timeout = 0
-		// This is not in the documentation, but it looks like communication is a couple
-		// of orders of magnitude more stable if we introduce a delay after each command
-		time.Sleep(time.Millisecond * 500)
+	return err
+}
 
-		return ACK
-	}
-	time.Sleep(timeout)
-	timeout++
+// Light : [7.5 SET BAUD RATE (AA07h)]
+// In case of NAK/COmmand Id errors, try lowering the baud rate.
+func (c *Camera) SetBaudRate(baudrate int) error {
+	var d1 byte
+	var d2 byte
 
-	return TIMEOUT
+	switch baudrate {
+	case 2400:
+		d1 = 31
+		d2 = 47
+	case 4800:
+		d1 = 31
+		d2 = 23
+	case 9600:
+		d1 = 31
+		d2 = 11
+	case 19200:
+		d1 = 31
+		d2 = 5
+	case 38400:
+		d1 = 31
+		d2 = 2
+	case 57600:
+		d1 = 31
+		d2 = 1
+	case 115200:
+		d1 = 31
+		d2 = 0
+	case 153600:
+		d1 = 7
+		d2 = 2
+	case 230400:
+		d1 = 7
+		d2 = 1
+	case 460800:
+		d1 = 7
+		d2 = 0
+	case 921600:
+		d1 = 1
+		d2 = 1
+	case 1228800:
+		d1 = 2
+		d2 = 0
+	case 1843200:
+		d1 = 1
+		d2 = 0
+	case 3686400:
+		d1 = 0
+		d2 = 0
+	default:
+		return fmt.Errorf("Invalid baudrate (%d). Valid baudrates are: 2400, 4800, 9600, 19200, 38400, 57600, 115200, 153600, 230400, 460800, 921600, 1228800, 1843200, 3686400", baudrate)
+	}
+
+	_, err := c.command([]byte{0xAA, 0x07, d1, d2, 0x00, 0x00})
+	if err == nil && c.logging {
+		log.Printf("Baud rate changed to %d\n", baudrate)
+	}
+
+	c.port.Flush()
+	c.port.Close()
+	config := &serial.Config{Name: c.portName, Baud: baudrate, ReadTimeout: time.Millisecond * 500}
+	port, _ := serial.OpenPort(config)
+	c.port = port
+
+	time.Sleep(time.Millisecond * 500) // [13. 'First Photo Delay']
+
+	return err
 }
 
 // Connect sends sync command to camera. Camera should respond with ACK
-// Camera will normally ack within 25 attempts
+// Camera will normally ack within 25-60
+// [8.1 Synchronizing the uCam-III]
 func (c *Camera) Connect() error {
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		response := c.command(syncCommand)
-		if response == ACK {
-			// Acknowledge sync
-			ack[2] = 0x0D
-			_, errAck := c.port.Write(ack)
-			if errAck != nil {
-				log.Fatal(errAck)
-			}
+	ack := []byte{0xAA, 0x0E, 0x00, 0x00, 0x00, 0x00}
 
-			log.Println("ACK     : ", fmt.Sprintf("%02X %02X %02X %02X %02X %02X", ack[0], ack[1], ack[2], ack[3], ack[4], ack[5]))
-
-			if c.logging {
-				log.Println("Established connection with camera")
-			}
-			return nil
-		}
+	_, err := c.command([]byte{0xAA, 0x0D, 0x00, 0x00, 0x00, 0x00})
+	if err != nil {
+		return err
 	}
-	return errors.New("Unable to connect to camera (Sync command failed. Invalid camera response.)")
+	// Acknowledge sync
+	ack[2] = 0x0D
+	_, errAck := c.port.Write(ack)
+	if errAck != nil {
+		log.Fatal(errAck)
+	}
+
+	if c.logging {
+		log.Println("Established connection with camera")
+	}
+	time.Sleep(time.Millisecond * 1000) // [13. 'First Photo Delay']
+	return nil
 }
 
 // DisableSleepTimeout disables sleep mode, by sending 0 as the sleep argument
@@ -202,90 +354,66 @@ func (c *Camera) DisableSleepTimeout() error {
 	return c.SetSleepTimeout(0)
 }
 
-// SetSleepTimeout adjusts the sleep timeout from the default 15 seconds to the specified timeoutValue
+// SetSleepTimeout adjusts the sleep timeout from the default 15 seconds to the specified timeoutValue [7.13 SLEEP (AA15h)]
 func (c *Camera) SetSleepTimeout(timeoutValue byte) error {
-	sleepCommand[2] = timeoutValue
-	// The sleep command is a bit flaky. It may require multiple attempts before the camera responds with ACK
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		response := c.command(sleepCommand)
-		if response == ACK {
-			if c.logging {
-				log.Printf("Sleep timeout set to : %d\n", timeoutValue)
-			}
-			return nil
-		}
+	var sleepCommand = []byte{0xAA, 0x15, timeoutValue, 0x00, 0x00, 0x00}
+
+	_, err := c.command(sleepCommand)
+	if err == nil && c.logging {
+		log.Printf("Sleep timeout set to : %d\n", timeoutValue)
 	}
-	return fmt.Errorf("Sleep command failed.")
+	return err
 }
 
+// SetImageFormats : [7.1 INITIAL (AA01h)]
 func (c *Camera) SetImageFormats(format ImageFormatType, rawResolution RAWResolutionType, jpegResolution JPEGResolutionType) error {
-	initialCommand[3] = byte(format)
-	initialCommand[4] = byte(rawResolution)
-	initialCommand[5] = byte(jpegResolution)
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		response := c.command(initialCommand)
-		if response == ACK {
-			if c.logging {
-				log.Printf("Image format and resolution set.\n")
-			}
-			return nil
-		}
+	_, err := c.command([]byte{0xAA, 0x01, 0x00, byte(format), byte(rawResolution), byte(jpegResolution)})
+	if err == nil && c.logging {
+		log.Printf("Image format and resolution set.\n")
+
 	}
-	return fmt.Errorf("Initialize command failed")
+	return err
 }
 
+// SetExposure : [7.12 CONTRAST/BRIGHTNESS/EXPOSURE (AA14h)]
 func (c *Camera) SetExposure(contrast ContrastType, brightness BrightnessType, exposure ExposureType) error {
-	exposureCommand[2] = byte(contrast)
-	exposureCommand[3] = byte(brightness)
-	exposureCommand[4] = byte(exposure)
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		response := c.command(exposureCommand)
-		if response == ACK {
-			if c.logging {
-				log.Printf("Exposure set.\n")
-			}
-			return nil
-		}
+	_, err := c.command([]byte{0xAA, 0x14, byte(contrast), byte(brightness), byte(exposure), 0x00})
+	if err == nil && c.logging {
+		log.Printf("Exposure set.\n")
 	}
-	return fmt.Errorf("Initialize command failed")
+	return err
 }
 
+// SetPackageSize : [7.4 PACKAGE SIZE (AA06)]
 func (c *Camera) SetPackageSize(size uint16) error {
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		setPackageSizeCommand[3] = byte(size & 0xFF)
-		setPackageSizeCommand[4] = byte((size & 0xFF00) >> 8)
-		response := c.command(setPackageSizeCommand)
-		if response == ACK {
-			if c.logging {
-				log.Printf("Package size set.\n")
-			}
-			c.packageSize = size
-			return nil
-		}
+	_, err := c.command([]byte{0xAA, 0x06, 0x08, byte(size & 0xFF), byte((size & 0xFF00) >> 8), 0x00})
+	if err == nil && c.logging {
+		log.Printf("Package size set.\n")
 	}
-	return fmt.Errorf("Snapshot command failed")
+	c.packageSize = size
+	return err
 }
 
+// Snapshot : [7.3 SNAPSHOT (AA05h)]
 func (c *Camera) Snapshot(pictureType SnapshotType) error {
+	var snapshotCommand = []byte{0xAA, 0x05, 0x00, 0x00, 0x00, 0x00}
 	switch pictureType {
 	case RAW:
 		snapshotCommand[2] = 0x01
 	case JPEG:
 		snapshotCommand[2] = 0x00
 	}
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		response := c.command(snapshotCommand)
-		if response == ACK {
-			if c.logging {
-				log.Printf("Snapshot held in buffer.\n")
-			}
-			return nil
-		}
+	_, err := c.command(snapshotCommand)
+	if err == nil && c.logging {
+		log.Printf("Snapshot held in buffer.\n")
 	}
-	return fmt.Errorf("Snapshot command failed")
+	time.Sleep(time.Millisecond * 200) // [13. 'Shutter Delay']
+	return err
 }
 
+// GetPicture : [7.2 GET PICTURE (AA04h)]
 func (c *Camera) GetPicture(pictureType SnapshotType) ([]byte, error) {
+	var getPictureCommand = []byte{0xAA, 0x04, 0x00, 0x00, 0x00, 0x00}
 	switch pictureType {
 	case RAW:
 		getPictureCommand[2] = 0x02
@@ -294,48 +422,73 @@ func (c *Camera) GetPicture(pictureType SnapshotType) ([]byte, error) {
 	case Snapshot:
 		getPictureCommand[2] = 0x01
 	}
-	for attempt := 0; attempt < maxRetries; attempt++ {
 
-		response := c.command(getPictureCommand)
+	response, err := c.command(getPictureCommand)
+	if err != nil {
+		return nil, err
+	}
 
-		if response == ACK {
-			if c.logging {
-				log.Printf("Fetching image data.\n")
-			}
+	imageSize := uint16(response[10])<<8 + uint16(response[9])
+	if c.logging {
+		log.Printf("Image size is: %d bytes", imageSize)
+	}
+	imageBuffer := make([]byte, 0)
 
-			var framecounter byte
-			var frameRequestCommand = []byte{0xAA, 0x0E, 0x00, 0x00, 0x00, 0x00}
-			var bytecounter int
+	if c.logging {
+		log.Printf("Fetching image data.\n")
+	}
 
-			for {
-				frameRequestCommand[2] = framecounter
+	var framecounter uint16
+	frameAck := []byte{0xAA, 0x0E, 0x00, 0x00, 0x00, 0x00}
+	dataStartAck := []byte{0xAA, 0x0E, 0x00, 0x00, 0x00, 0x00}
 
-				_, errRequest := c.port.Write(frameRequestCommand)
-				if errRequest != nil {
-					log.Fatal(errRequest)
-				}
+	_, errRequest := c.port.Write(dataStartAck) // ACK Data transmission start
+	if errRequest != nil {
+		log.Fatal(errRequest)
+	}
 
-				frameReceiveBuffer := make([]byte, c.packageSize)
-				n, err := c.port.Read(frameReceiveBuffer)
+	// Switch to blocking read
+	c.port.Close()
+	config := &serial.Config{Name: c.portName, Baud: c.baudRate}
+	port, _ := serial.OpenPort(config)
+	c.port = port
 
-				bytecounter += n
-				if err != nil {
-					log.Fatal(err)
-				}
-				// TODO: Checksum
+	// Ready to receive frames
+	readBytes := 0
+	for {
+		frameReceiveBuffer := make([]byte, c.packageSize)
 
-				log.Printf("Received %d bytes\n", n)
+		n, err := c.port.Read(frameReceiveBuffer)
+		if err != nil {
+			log.Fatal(err)
+		}
 
-				_, errAck := c.port.Write(ack)
-				if errAck != nil {
-					log.Fatal(errAck)
-				}
-				// time.Sleep(time.Millisecond * 250)
+		if n == 0 {
+			break
+		}
 
-				// TODO: Read out ID + size. Compose receive buffer
-			}
+		// Package structure:
+		// ID: 2 bytes
+		// Data Size: 2 bytes
+		// Image data: package size - 6 bytes
+		// Verify code: 2 bytes
+		log.Printf("Frame  %02X %02X %02X %02X [%d]", frameReceiveBuffer[0], frameReceiveBuffer[1], frameReceiveBuffer[2], frameReceiveBuffer[3], n)
 
+		imageBuffer = append(imageBuffer, frameReceiveBuffer[3:]...)
+		readBytes += n
+
+		// TODO:
+		// 1) read frame ID (for ack), Checksum
+		// 2) decode frame
+
+		frameAck[4] = byte(framecounter & 0x00FF)
+		hb := (framecounter & 0xFF00) >> 8
+		frameAck[5] = byte(hb)
+
+		_, errAck := c.port.Write(frameAck)
+		if errAck != nil {
+			log.Fatal(errAck)
 		}
 	}
-	return nil, fmt.Errorf("Snapshot command failed")
+	return imageBuffer, nil
 }
