@@ -2,10 +2,9 @@ package ucam
 
 import (
 	"bytes"
+	"fmt"
 	"log"
 	"time"
-
-	"fmt"
 
 	"github.com/tarm/serial"
 )
@@ -213,16 +212,17 @@ func (c *Camera) command(command []byte) ([]byte, error) {
 		if c.logging {
 			log.Println("Sent    : ", fmt.Sprintf("%02X %02X %02X %02X %02X %02X", command[0], command[1], command[2], command[3], command[4], command[5]))
 		}
+
 		n, errorRead := c.port.Read(response)
 		// EOF is ok. The camera doesn't respond if it is asleep
 		if errorRead != nil && n != 0 {
 			return nil, errorRead
 		}
 
-		/*	if c.logging {
-				log.Println("Received: ", fmt.Sprintf("%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X", response[0], response[1], response[2], response[3], response[4], response[5], response[6], response[7], response[8], response[9], response[10], response[11]))
-			}
-		*/
+		if c.logging {
+			log.Println("Received: ", fmt.Sprintf("%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X", response[0], response[1], response[2], response[3], response[4], response[5], response[6], response[7], response[8], response[9], response[10], response[11]))
+		}
+
 		if bytes.Equal(response[:2], ack[:2]) {
 			timeout = defaultTimeout
 			return response, nil
@@ -320,7 +320,7 @@ func (c *Camera) SetBaudRate(baudrate int) error {
 	port, _ := serial.OpenPort(config)
 	c.port = port
 
-	time.Sleep(time.Millisecond * 500) // [13. 'First Photo Delay']
+	time.Sleep(time.Millisecond * 500)
 
 	return err
 }
@@ -345,7 +345,8 @@ func (c *Camera) Connect() error {
 	if c.logging {
 		log.Println("Established connection with camera")
 	}
-	time.Sleep(time.Millisecond * 1000) // [13. 'First Photo Delay']
+	c.port.Flush()
+	time.Sleep(time.Millisecond * 2000) // [13. 'First Photo Delay']
 	return nil
 }
 
@@ -413,6 +414,7 @@ func (c *Camera) Snapshot(pictureType SnapshotType) error {
 
 // GetPicture : [7.2 GET PICTURE (AA04h)]
 func (c *Camera) GetPicture(pictureType SnapshotType) ([]byte, error) {
+	// TODO: Split into separate methods (PacketSize is only relevant for JPEG)
 	var getPictureCommand = []byte{0xAA, 0x04, 0x00, 0x00, 0x00, 0x00}
 	switch pictureType {
 	case RAW:
@@ -432,63 +434,59 @@ func (c *Camera) GetPicture(pictureType SnapshotType) ([]byte, error) {
 	if c.logging {
 		log.Printf("Image size is: %d bytes", imageSize)
 	}
-	imageBuffer := make([]byte, 0)
+	imageBuffer := make([]byte, imageSize)
 
 	if c.logging {
 		log.Printf("Fetching image data.\n")
 	}
 
-	var framecounter uint16
 	frameAck := []byte{0xAA, 0x0E, 0x00, 0x00, 0x00, 0x00}
-	dataStartAck := []byte{0xAA, 0x0E, 0x00, 0x00, 0x00, 0x00}
 
-	_, errRequest := c.port.Write(dataStartAck) // ACK Data transmission start
+	_, errRequest := c.port.Write(frameAck)
 	if errRequest != nil {
 		log.Fatal(errRequest)
 	}
 
-	// Switch to blocking read
-	c.port.Close()
-	config := &serial.Config{Name: c.portName, Baud: c.baudRate}
-	port, _ := serial.OpenPort(config)
-	c.port = port
-
-	// Ready to receive frames
-	readBytes := 0
+	var imageBufferInsertIndex uint16
+	var allFramesRead bool
 	for {
 		frameReceiveBuffer := make([]byte, c.packageSize)
-
-		n, err := c.port.Read(frameReceiveBuffer)
-		if err != nil {
-			log.Fatal(err)
+		var bufferInsertIndex uint16
+		var expectedDataSizeRead = false
+		var frameSize uint16
+		for bufferInsertIndex < c.packageSize {
+			readBytes, _ := c.port.Read(frameReceiveBuffer[bufferInsertIndex:])
+			bufferInsertIndex += uint16(readBytes)
+			if readBytes >= 4 && !expectedDataSizeRead {
+				frameSize = uint16(frameReceiveBuffer[2]) + uint16(frameReceiveBuffer[3])<<8
+				log.Printf("Framesize is: %d\n", frameSize)
+				expectedDataSizeRead = true
+			}
+			if readBytes == 0 && frameSize <= (c.packageSize+6) {
+				allFramesRead = true
+				break
+			}
 		}
 
-		if n == 0 {
-			break
-		}
-
-		// Package structure:
-		// ID: 2 bytes
-		// Data Size: 2 bytes
-		// Image data: package size - 6 bytes
-		// Verify code: 2 bytes
-		log.Printf("Frame  %02X %02X %02X %02X [%d]", frameReceiveBuffer[0], frameReceiveBuffer[1], frameReceiveBuffer[2], frameReceiveBuffer[3], n)
-
-		imageBuffer = append(imageBuffer, frameReceiveBuffer[3:]...)
-		readBytes += n
-
-		// TODO:
-		// 1) read frame ID (for ack), Checksum
-		// 2) decode frame
-
-		frameAck[4] = byte(framecounter & 0x00FF)
-		hb := (framecounter & 0xFF00) >> 8
-		frameAck[5] = byte(hb)
-
+		frameAck[4] = byte(frameReceiveBuffer[0])
+		frameAck[5] = byte(frameReceiveBuffer[1])
+		/*		log.Printf("ACK  %02X %02X %02X %02X %02X %02X\n",
+				frameAck[0], frameAck[1], frameAck[2], frameAck[3], frameAck[4], frameAck[5])
+		*/
 		_, errAck := c.port.Write(frameAck)
 		if errAck != nil {
 			log.Fatal(errAck)
 		}
+
+		if expectedDataSizeRead {
+			copy(imageBuffer[imageBufferInsertIndex:], frameReceiveBuffer[4:frameSize+4])
+			imageBufferInsertIndex += frameSize
+			log.Println("InsertIndex: ", imageBufferInsertIndex, "image size :", len(imageBuffer))
+		}
+		if allFramesRead {
+			break
+		}
 	}
+
 	return imageBuffer, nil
 }
