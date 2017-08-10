@@ -5,7 +5,7 @@ Eearly days yet, but JPEG seems to work ok.
 
 ## Example code (without error handling) 
 
-´´´
+```
 import "github.com/hansj66/ucam-iii/ucam"
 import "log"
 import "io/ioutil"
@@ -26,4 +26,4 @@ func main() {
 	ioutil.WriteFile("./test.jpg", image, 0644)
 
 }
-´´´
+```
